@@ -109,3 +109,6 @@ output.mp4
 
 # ignore folder
 tmpSuperSloMo/
+.tmpSuperSloMo/
+
+output.mkv

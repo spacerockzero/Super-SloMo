@@ -3,7 +3,8 @@ import argparse
 import os
 import os.path
 import ctypes
-from shutil import rmtree, move
+from posixpath import abspath
+from shutil import rmtree, move, copytree
 from PIL import Image
 import torch
 import torchvision.transforms as transforms
@@ -11,6 +12,9 @@ import model
 import dataloader
 import platform
 from tqdm import tqdm
+import math
+import itertools
+from more_itertools import consume
 
 # For parsing commandline arguments
 parser = argparse.ArgumentParser()
@@ -21,7 +25,57 @@ parser.add_argument("--fps", type=float, default=30, help='specify fps of output
 parser.add_argument("--sf", type=int, required=True, help='specify the slomo factor N. This will increase the frames by Nx. Example sf=2 ==> 2x frames')
 parser.add_argument("--batch_size", type=int, default=1, help='Specify batch size for faster conversion. This will depend on your cpu/gpu memory. Default: 1')
 parser.add_argument("--output", type=str, default="output.mkv", help='Specify output file name. Default: output.mp4')
+parser.add_argument("--copy_frames", type=bool, default=False, help='Should I copy processed frames to specified dir. Default: False')
+parser.add_argument("--copy_frames_to", type=str, default="./", help='Copy processed frames to specified dir. Default: ./')
+parser.add_argument("--resume", type=bool, default=False, help='Resume run from last saved interval. Default: False')
+parser.add_argument("--save_interval", type=int, default=100, help='How often by input frame to save progress. Default: 100')
+parser.add_argument("--img_dir", type=str, default=False, help='Where you get your raw frame images from, if we are doing an image morph instead of slowmo video. Default: False')
 args = parser.parse_args()
+
+def save_progress(frame, dir):
+    # print('saving progress', frame)
+    """
+    Saves the progress of the conversion.
+
+    Parameters
+    ----------
+        frame : int
+            current frame number.
+        dir : string
+            path to directory to output the progress.
+
+    Returns
+    -------
+        None
+    """
+
+    with open(os.path.join(dir, "progress.txt"), "w") as f:
+        f.write("{}".format(frame))
+
+def read_progress(dir):
+    print('reading progress')
+    """
+    Reads the progress of the conversion.
+
+    Parameters
+    ----------
+        dir : string
+            path to directory to read the progress.
+
+    Returns
+    -------
+        frame : int
+            current frame number.
+    """
+    frame = 0
+    filepath = os.path.join(dir, "progress.txt")
+    if os.path.isfile(filepath):
+        with open(filepath, "r") as f:
+            frame = int(f.read())
+    else:
+        print("No progress file found. Creating one.")
+        save_progress(frame, dir)
+    return frame
 
 def check():
     """
@@ -45,8 +99,8 @@ def check():
         error = "Error: --batch_size has to be atleast 1"
     if (args.fps < 1):
         error = "Error: --fps has to be atleast 1"
-    if ".mkv" not in args.output:
-        error = "output needs to have mkv container"
+    # if ".mkv" not in args.output:
+    #     error = "output needs to have mkv container"
     return error
 
 def extract_frames(video, outDir):
@@ -81,6 +135,29 @@ def extract_frames(video, outDir):
         error = "Error converting file:{}. Exiting.".format(video)
     return error
 
+def copy_frames(src_dir, dst_dir):
+    """
+    Copies the frames from `src_dir` to `dst_dir`.
+
+    Parameters
+    ----------
+        src_dir : string
+            path to the source directory.
+        dst_dir : string
+            path to the destination directory.
+
+    Returns
+    -------
+        None
+    """
+
+    print("Copying frames from {} to {}".format(src_dir, dst_dir))
+    error = ""
+    retn = copytree(src_dir, dst_dir)
+    if retn:
+        print("Error copying frames. Exiting.")
+    return error
+
 def create_video(dir):
     IS_WINDOWS = 'Windows' == platform.system()
 
@@ -90,19 +167,22 @@ def create_video(dir):
         ffmpeg_path = "ffmpeg"
 
     error = ""
-    print('{} -r {} -i {}/%d.png -vcodec ffvhuff {}'.format(ffmpeg_path, args.fps, dir, args.output))
-    retn = os.system('{} -r {} -i {}/%d.png -vcodec ffvhuff "{}"'.format(ffmpeg_path, args.fps, dir, args.output))
+    # print('{} -r {} -i {}/%d.png -vcodec ffvhuff {}'.format(ffmpeg_path, args.fps, dir, args.output))
+    # retn = os.system('{} -r {} -i {}/%d.png -vcodec ffvhuff "{}"'.format(ffmpeg_path, args.fps, dir, args.output))
+    print('{} -r {} -i {}/%d.png -c:v libx264 -vf {}'.format(ffmpeg_path, args.fps, dir, args.output))
+    retn = os.system('{} -r {} -i {}/%d.png -c:v libx264 -vf "{}"'.format(ffmpeg_path, args.fps, dir, args.output))
     if retn:
         error = "Error creating output video. Exiting."
     return error
 
 
 def main():
+    print('args', args)
     # Check if arguments are okay
-    error = check()
-    if error:
-        print(error)
-        exit(1)
+    # error = check()
+    # if error:
+    #     print(error)
+    #     exit(1)
 
     # Create extraction folder and extract frames
     IS_WINDOWS = 'Windows' == platform.system()
@@ -110,9 +190,9 @@ def main():
     if not IS_WINDOWS:
         # Assuming UNIX-like system where "." indicates hidden directories
         extractionDir = "." + extractionDir
-    if os.path.isdir(extractionDir):
+    if os.path.isdir(extractionDir) and args.resume != True:
         rmtree(extractionDir)
-    os.mkdir(extractionDir)
+        os.mkdir(extractionDir)
     if IS_WINDOWS:
         FILE_ATTRIBUTE_HIDDEN = 0x02
         # ctypes.windll only exists on Windows
@@ -120,12 +200,17 @@ def main():
 
     extractionPath = os.path.join(extractionDir, "input")
     outputPath     = os.path.join(extractionDir, "output")
-    os.mkdir(extractionPath)
-    os.mkdir(outputPath)
-    error = extract_frames(args.video, extractionPath)
-    if error:
-        print(error)
-        exit(1)
+    progress_path  = abspath(extractionDir)
+    if args.resume != True:
+        os.mkdir(extractionPath)
+        os.mkdir(outputPath)
+        if args.img_dir:
+            copy_frames(args.img_dir, abspath(extractionPath))
+        else:
+            error = extract_frames(args.video, extractionPath)
+        if error:
+            print(error)
+            exit(1)
 
     # Initialize transforms
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -148,7 +233,18 @@ def main():
         TP = transforms.Compose([revNormalize, transforms.ToPILImage()])
 
     # Load data
-    videoFrames = dataloader.Video(root=extractionPath, transform=transform)
+    frameCounter = 1
+    input_frame = 0
+    save_interval = args.save_interval if args.save_interval is not None else 100
+    if args.resume == True:
+        print('resume')
+        # sync input progress
+        input_frame = read_progress(progress_path)
+        # sync output progress
+        frameCounter = input_frame * args.sf
+        print('frameCounter', frameCounter)
+
+    videoFrames = dataloader.Video(root=extractionPath, transform=transform, resume=input_frame)
     videoFramesloader = torch.utils.data.DataLoader(videoFrames, batch_size=args.batch_size, shuffle=False)
 
     # Initialize model
@@ -168,11 +264,10 @@ def main():
     ArbTimeFlowIntrp.load_state_dict(dict1['state_dictAT'])
     flowComp.load_state_dict(dict1['state_dictFC'])
 
-    # Interpolate frames
-    frameCounter = 1
-
     with torch.no_grad():
         for _, (frame0, frame1) in enumerate(tqdm(videoFramesloader), 0):
+            # print('output frame:', frameCounter)
+            # print('iteration:', _)
 
             I0 = frame0.to(device)
             I1 = frame1.to(device)
@@ -215,16 +310,27 @@ def main():
                 # Save intermediate frame
                 for batchIndex in range(args.batch_size):
                     (TP(Ft_p[batchIndex].cpu().detach())).resize(videoFrames.origDim, Image.BILINEAR).save(os.path.join(outputPath, str(frameCounter + args.sf * batchIndex) + ".png"))
+
                 frameCounter += 1
 
             # Set counter accounting for batching of frames
             frameCounter += args.sf * (args.batch_size - 1)
+            progress = math.floor(frameCounter / args.sf)
+            # print("input frame progress:", progress)
+            if progress % save_interval == 0:
+                # save the input frame number for resuming
+                save_progress(progress, progress_path)
 
     # Generate video from interpolated frames
     create_video(outputPath)
 
-    # Remove temporary files
-    rmtree(extractionDir)
+    if args.copy_frames:
+        print('args.copy_frames_to', args.copy_frames_to)
+        copytree(outputPath, args.copy_frames_to)
+
+    if args.resume != False:
+        # Remove temporary files
+        rmtree(extractionDir)
 
     exit(0)
 
